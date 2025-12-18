@@ -1,3 +1,13 @@
-opencv-python
-mediapipe
-numpy
+ (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
+diff --git a/requirements.txt b/requirements.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..9932181860d7a55b37f8d27f91701b6cb5d5f3df
+--- /dev/null
++++ b/requirements.txt
+@@ -0,0 +1,3 @@
++opencv-python
++mediapipe
++numpy
+ 
+EOF
+)
