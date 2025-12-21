@@ -1,18 +1,23 @@
+import os
+import time
+import csv
+import json
+from collections import deque
+
 import cv2
 import numpy as np
 import mediapipe as mp
-from collections import deque
-import time
-import os
-import csv
-import json
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+from PIL import Image, ImageTk
 
 from sklearn.linear_model import SGDClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
 import joblib
 
-APP_NAME = "Facial-Expression-Reading"
+APP_NAME = "Facial-Expression-Reading (GUI)"
 
 # -----------------------------
 # Data folder (created next to this script)
@@ -37,31 +42,19 @@ CLASSES = np.array([
     "Fear",
 ])
 
-KEY_TO_LABEL = {
-    ord('1'): "Neutral",
-    ord('2'): "Happy",
-    ord('3'): "Surprised",
-    ord('4'): "AngryFocused",
-    ord('5'): "Sad",
-    ord('6'): "Disgust",
-    ord('7'): "Fear",
+LABEL_TO_PRETTY = {
+    "Neutral": "Neutral 😐",
+    "Happy": "Happy 🙂",
+    "Surprised": "Surprised 😮",
+    "AngryFocused": "Angry/Focused 😠",
+    "Sad": "Sad 😔",
+    "Disgust": "Disgust 🤢",
+    "Fear": "Fear 😨",
 }
 
 # -----------------------------
 # Helpers
 # -----------------------------
-def dist(a, b):
-    return float(np.linalg.norm(a - b))
-
-
-def safe_div(a, b, eps=1e-6):
-    return a / (b + eps)
-
-
-def ema(prev, new, alpha=0.2):
-    return new if prev is None else (alpha * new + (1 - alpha) * prev)
-
-
 def now_iso():
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -82,9 +75,7 @@ def load_baseline():
         return None
     try:
         with open(BASELINE_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        # Expect keys: eye_open, mouth_open, smile, brow_raise
-        return data
+            return json.load(f)
     except Exception:
         return None
 
@@ -95,6 +86,18 @@ def save_baseline(baseline: dict):
             json.dump(baseline, f, indent=2)
     except Exception:
         pass
+
+
+def dist(a, b):
+    return float(np.linalg.norm(a - b))
+
+
+def safe_div(a, b, eps=1e-6):
+    return a / (b + eps)
+
+
+def ema(prev, new, alpha=0.25):
+    return new if prev is None else (alpha * new + (1 - alpha) * prev)
 
 
 # -----------------------------
@@ -157,7 +160,7 @@ IDX = {
     "jaw_right_mid": 397,
     "jaw_right": 454,
 
-    # Face oval (full contour anchors)
+    # Face oval (anchor points)
     "face_top": 10,
     "face_left_top": 338,
     "face_left_bottom": 234,
@@ -197,16 +200,14 @@ def extract_features(pts):
         "mouth_open": mouth_open_ratio,
         "smile": smile_ratio,
         "brow_raise": brow_raise,
-        "face_h": face_h,
     }
 
 
 def mean_dict(dicts, keys):
-    arr = {k: [] for k in keys}
-    for d in dicts:
-        for k in keys:
-            arr[k].append(d[k])
-    return {k: float(np.mean(arr[k])) if arr[k] else 0.0 for k in keys}
+    out = {}
+    for k in keys:
+        out[k] = float(np.mean([d[k] for d in dicts])) if dicts else 0.0
+    return out
 
 
 def baseline_deltas(s_feats, baseline):
@@ -218,24 +219,79 @@ def baseline_deltas(s_feats, baseline):
     ], dtype=np.float32)
 
 
-def pretty_label(lbl):
-    return {
-        "Neutral": "Neutral 😐",
-        "Happy": "Happy 🙂",
-        "Surprised": "Surprised 😮",
-        "AngryFocused": "Angry/Focused 😠",
-        "Sad": "Sad 😔",
-        "Disgust": "Disgust 🤢",
-        "Fear": "Fear 😨",
-    }.get(lbl, lbl)
-
-
 # -----------------------------
-# Model utilities
+# Model utilities (auto-retrain on startup)
 # -----------------------------
 def make_model():
     clf = SGDClassifier(loss="log_loss", alpha=0.0005, random_state=42)
     return make_pipeline(StandardScaler(with_mean=True, with_std=True), clf)
+
+
+def save_model(model, initialized: bool):
+    payload = {"model": model, "initialized": initialized, "classes": CLASSES.tolist()}
+    joblib.dump(payload, MODEL_PATH)
+
+
+def load_model():
+    if not os.path.exists(MODEL_PATH):
+        return None, False
+    try:
+        payload = joblib.load(MODEL_PATH)
+        return payload.get("model"), bool(payload.get("initialized"))
+    except Exception:
+        return None, False
+
+
+def load_labeled_dataset():
+    if not os.path.exists(LABELED_PATH):
+        return None, None
+
+    X, y = [], []
+    try:
+        with open(LABELED_PATH, "r", newline="", encoding="utf-8") as f:
+            r = csv.DictReader(f)
+            for row in r:
+                lbl = row.get("true_label", "")
+                if lbl not in CLASSES:
+                    continue
+                try:
+                    X.append([
+                        float(row["d_eye"]),
+                        float(row["d_mouth"]),
+                        float(row["d_smile"]),
+                        float(row["d_brow"]),
+                    ])
+                    y.append(lbl)
+                except Exception:
+                    continue
+    except Exception:
+        return None, None
+
+    if not X:
+        return None, None
+    return np.array(X, dtype=np.float32), np.array(y, dtype=object)
+
+
+def retrain_on_startup():
+    X, y = load_labeled_dataset()
+    if X is None or y is None:
+        model, initialized = load_model()
+        return model, initialized, 0
+
+    model = make_model()
+    scaler = model.steps[0][1]
+    clf = model.steps[-1][1]
+
+    scaler.fit(X)
+    Xs = scaler.transform(X)
+
+    clf.partial_fit(Xs[:1], y[:1], classes=CLASSES)
+    if len(Xs) > 1:
+        clf.partial_fit(Xs[1:], y[1:])
+
+    initialized = True
+    save_model(model, initialized)
+    return model, initialized, int(len(X))
 
 
 def model_predict(model, x):
@@ -258,324 +314,410 @@ def model_online_update(model, x, y, initialized):
     if model is None:
         model = make_model()
     clf = model.steps[-1][1]
+
+    # x comes in unscaled; pipeline handles scaling on predict, but for partial_fit we need to scale ourselves
+    scaler = model.steps[0][1]
+    try:
+        _ = scaler.mean_
+        fitted = True
+    except Exception:
+        fitted = False
+
+    if not fitted:
+        scaler.fit(x)
+    xs = scaler.transform(x)
+
     if not initialized:
-        clf.partial_fit(x, np.array([y]), classes=CLASSES)
+        clf.partial_fit(xs, np.array([y]), classes=CLASSES)
         initialized = True
     else:
-        clf.partial_fit(x, np.array([y]))
+        clf.partial_fit(xs, np.array([y]))
     return model, initialized
 
 
-def save_model(model, initialized):
-    payload = {"model": model, "initialized": initialized, "classes": CLASSES.tolist()}
-    joblib.dump(payload, MODEL_PATH)
-
-
-def load_model():
-    if not os.path.exists(MODEL_PATH):
-        return None, False
-    try:
-        payload = joblib.load(MODEL_PATH)
-        return payload.get("model"), bool(payload.get("initialized"))
-    except Exception:
-        return None, False
-
-
-def load_labeled_dataset():
-    """Load X,y from LABELED_PATH; X is (n,4), y is (n,)"""
-    if not os.path.exists(LABELED_PATH):
-        return None, None
-
-    X = []
-    y = []
-    try:
-        with open(LABELED_PATH, "r", newline="", encoding="utf-8") as f:
-            r = csv.DictReader(f)
-            for row in r:
-                lbl = row.get("true_label", "")
-                if lbl not in CLASSES:
-                    continue
-                try:
-                    d_eye = float(row["d_eye"])
-                    d_mouth = float(row["d_mouth"])
-                    d_smile = float(row["d_smile"])
-                    d_brow = float(row["d_brow"])
-                except Exception:
-                    continue
-                X.append([d_eye, d_mouth, d_smile, d_brow])
-                y.append(lbl)
-    except Exception:
-        return None, None
-
-    if not X:
-        return None, None
-
-    return np.array(X, dtype=np.float32), np.array(y, dtype=object)
-
-
-def retrain_on_startup():
-    """
-    Auto-retrain model from fer_labeled_samples.csv if available.
-    Returns (model, initialized, n_samples_used).
-    """
-    X, y = load_labeled_dataset()
-    if X is None or y is None:
-        model, initialized = load_model()
-        return model, initialized, 0
-
-    model = make_model()
-    clf = model.steps[-1][1]
-
-    scaler = model.steps[0][1]
-    scaler.fit(X)
-    Xs = scaler.transform(X)
-
-    clf.partial_fit(Xs[:1], y[:1], classes=CLASSES)
-    if len(Xs) > 1:
-        clf.partial_fit(Xs[1:], y[1:])
-
-    initialized = True
-    save_model(model, initialized)
-    return model, initialized, int(len(X))
-
-
 # -----------------------------
-# Main
+# GUI App
 # -----------------------------
-def main():
-    ensure_csv_header(PRED_LOG_PATH, ["timestamp", "pred_label", "confidence", "d_eye", "d_mouth", "d_smile", "d_brow"])
-    ensure_csv_header(LABELED_PATH, ["timestamp", "true_label", "d_eye", "d_mouth", "d_smile", "d_brow"])
+class FERApp:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title(APP_NAME)
 
-    model, model_initialized, trained_n = retrain_on_startup()
-    baseline = load_baseline()
+        # CSV headers
+        ensure_csv_header(PRED_LOG_PATH, ["timestamp", "pred_label", "confidence", "d_eye", "d_mouth", "d_smile", "d_brow"])
+        ensure_csv_header(LABELED_PATH, ["timestamp", "true_label", "d_eye", "d_mouth", "d_smile", "d_brow"])
 
-    mp_face = mp.solutions.face_mesh
-    face_mesh = mp_face.FaceMesh(
-        static_image_mode=False,
-        max_num_faces=1,
-        refine_landmarks=True,
-        min_detection_confidence=0.6,
-        min_tracking_confidence=0.6
-    )
+        # Auto-retrain model
+        self.model, self.model_initialized, self.trained_n = retrain_on_startup()
 
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        raise RuntimeError("Could not open webcam. Try a different camera index (0, 1, 2...).")
+        # Baseline
+        self.baseline = load_baseline()
 
-    smooth = {k: None for k in FEAT_KEYS}
-    emotion_hist = deque(maxlen=12)
+        # Mediapipe FaceMesh
+        self.mp_face = mp.solutions.face_mesh
+        self.face_mesh = self.mp_face.FaceMesh(
+            static_image_mode=False,
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.6,
+            min_tracking_confidence=0.6,
+        )
 
-    calibrating = False
-    calib_samples = []
-    calib_start = 0.0
-    CALIB_SECONDS = 2.0
-    auto_calib_armed = (baseline is None)
+        # Camera
+        self.cap = cv2.VideoCapture(0)
+        if not self.cap.isOpened():
+            messagebox.showerror("Camera Error", "Could not open webcam. Try changing camera index in code.")
+            raise RuntimeError("Could not open webcam.")
 
-    LOG_INTERVAL_SEC = 0.5
-    last_log_time = 0.0
+        # State
+        self.smooth = {k: None for k in FEAT_KEYS}
+        self.emotion_hist = deque(maxlen=12)
+        self.last_x = None
+        self.last_d = None
 
-    last_x = None
-    last_d = None
+        # Calibration
+        self.calibrating = False
+        self.calib_samples = []
+        self.calib_start = 0.0
+        self.CALIB_SECONDS = 2.0
+        self.auto_calib_armed = (self.baseline is None)
 
-    last_time = time.time()
-    fps = 0.0
+        # Logging interval
+        self.LOG_INTERVAL_SEC = 0.5
+        self.last_log_time = 0.0
 
-    while True:
-        ok, frame = cap.read()
+        # UI layout
+        self._build_ui()
+
+        # Start loop
+        self.running = True
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.update_frame()
+
+    def _build_ui(self):
+        self.root.columnconfigure(0, weight=3)
+        self.root.columnconfigure(1, weight=2)
+        self.root.rowconfigure(0, weight=1)
+
+        # Left: video
+        video_frame = ttk.Frame(self.root, padding=8)
+        video_frame.grid(row=0, column=0, sticky="nsew")
+        video_frame.rowconfigure(0, weight=1)
+        video_frame.columnconfigure(0, weight=1)
+
+        self.video_label = ttk.Label(video_frame)
+        self.video_label.grid(row=0, column=0, sticky="nsew")
+
+        # Right: controls + status
+        side = ttk.Frame(self.root, padding=8)
+        side.grid(row=0, column=1, sticky="nsew")
+        side.columnconfigure(0, weight=1)
+
+        title = ttk.Label(side, text="Controls", font=("Segoe UI", 14, "bold"))
+        title.grid(row=0, column=0, sticky="w")
+
+        info = ttk.Label(
+            side,
+            text=f"Data folder:\n{DATA_DIR}\n\nAuto-train samples loaded: {self.trained_n}",
+            justify="left",
+        )
+        info.grid(row=1, column=0, sticky="w", pady=(6, 10))
+
+        # Buttons
+        btn_frame = ttk.LabelFrame(side, text="Label current expression", padding=8)
+        btn_frame.grid(row=2, column=0, sticky="ew")
+        for i in range(2):
+            btn_frame.columnconfigure(i, weight=1)
+
+        buttons = [
+            ("Neutral (1)", "Neutral"),
+            ("Happy (2)", "Happy"),
+            ("Surprised (3)", "Surprised"),
+            ("Angry (4)", "AngryFocused"),
+            ("Sad (5)", "Sad"),
+            ("Disgust (6)", "Disgust"),
+            ("Fear (7)", "Fear"),
+        ]
+        for idx, (txt, lbl) in enumerate(buttons):
+            r = 0 + idx // 2
+            c = idx % 2
+            b = ttk.Button(btn_frame, text=txt, command=lambda L=lbl: self.label_emotion(L))
+            b.grid(row=r, column=c, sticky="ew", padx=4, pady=4)
+
+        actions = ttk.LabelFrame(side, text="Actions", padding=8)
+        actions.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        actions.columnconfigure(0, weight=1)
+        actions.columnconfigure(1, weight=1)
+
+        ttk.Button(actions, text="Calibrate (neutral)", command=self.start_calibration).grid(row=0, column=0, sticky="ew", padx=4, pady=4)
+        ttk.Button(actions, text="Save model", command=self.save_model_clicked).grid(row=0, column=1, sticky="ew", padx=4, pady=4)
+        ttk.Button(actions, text="Open data folder", command=self.open_data_folder).grid(row=1, column=0, columnspan=2, sticky="ew", padx=4, pady=4)
+
+        # Status
+        self.status_var = tk.StringVar(value="Starting…")
+        self.pred_var = tk.StringVar(value="Prediction: —")
+        self.conf_var = tk.StringVar(value="Confidence: —")
+
+        ttk.Label(side, textvariable=self.pred_var, font=("Segoe UI", 12, "bold")).grid(row=4, column=0, sticky="w", pady=(12, 0))
+        ttk.Label(side, textvariable=self.conf_var).grid(row=5, column=0, sticky="w")
+        ttk.Label(side, textvariable=self.status_var, wraplength=320, justify="left").grid(row=6, column=0, sticky="w", pady=(10, 0))
+
+        # Keyboard shortcuts
+        self.root.bind("<Key>", self.on_key)
+
+    def on_key(self, event):
+        k = event.char
+        mapping = {
+            "1": "Neutral",
+            "2": "Happy",
+            "3": "Surprised",
+            "4": "AngryFocused",
+            "5": "Sad",
+            "6": "Disgust",
+            "7": "Fear",
+        }
+        if k in mapping:
+            self.label_emotion(mapping[k])
+        elif k.lower() == "c":
+            self.start_calibration()
+        elif k.lower() == "s":
+            self.save_model_clicked()
+        elif event.keysym == "Escape":
+            self.on_close()
+
+    def start_calibration(self):
+        self.calibrating = True
+        self.calib_samples = []
+        self.calib_start = time.time()
+        self.baseline = None
+        self.emotion_hist.clear()
+        self.last_x = None
+        self.last_d = None
+        self.status_var.set("Calibrating… Hold a neutral face for ~2 seconds.")
+
+    def save_model_clicked(self):
+        if self.model is None:
+            self.status_var.set("No model to save yet. Add some labels first.")
+            return
+        save_model(self.model, self.model_initialized)
+        self.status_var.set(f"Saved model to: {MODEL_PATH}")
+
+    def open_data_folder(self):
+        # Opens in File Explorer on Windows
+        try:
+            os.startfile(DATA_DIR)  # type: ignore[attr-defined]
+        except Exception:
+            self.status_var.set(f"Data folder: {DATA_DIR}")
+
+    def label_emotion(self, lbl: str):
+        if self.baseline is None or self.last_x is None or self.last_d is None:
+            self.status_var.set("Can’t label yet: wait for face + calibration.")
+            return
+
+        # Save labeled sample
+        append_csv_row(LABELED_PATH, [
+            now_iso(), lbl,
+            f"{self.last_d[0]:+.6f}", f"{self.last_d[1]:+.6f}", f"{self.last_d[2]:+.6f}", f"{self.last_d[3]:+.6f}"
+        ])
+
+        # Online update
+        self.model, self.model_initialized = model_online_update(self.model, self.last_x, lbl, self.model_initialized)
+        self.status_var.set(f"Labeled as {lbl} and trained on it. (Saved to fer_labeled_samples.csv)")
+
+    def draw_overlay(self, frame_bgr, pts):
+        # Points
+        draw_points = [
+            # Eyes + eyelids
+            "left_eye_top", "left_eye_bottom", "left_upper_lid", "left_lower_lid",
+            "right_eye_top", "right_eye_bottom", "right_upper_lid", "right_lower_lid",
+
+            # Brows
+            "left_brow", "right_brow",
+
+            # Nose + nostrils
+            "nose_bridge", "nose_tip", "nose_left", "nose_right",
+            "nostril_left", "nostril_right",
+
+            # Mouth / lips
+            "mouth_left", "mouth_right", "mouth_top", "mouth_bottom",
+            "upper_lip_left", "upper_lip_center", "upper_lip_right",
+            "lower_lip_left", "lower_lip_center", "lower_lip_right",
+
+            # Cheeks / smile lines
+            "left_cheek", "right_cheek",
+            "left_smile_line", "right_smile_line",
+
+            # Jaw / chin
+            "jaw_left", "jaw_left_mid", "chin", "jaw_right_mid", "jaw_right",
+
+            # Face oval anchors
+            "face_top", "face_left_top", "face_left_bottom",
+            "face_right_top", "face_right_bottom",
+        ]
+
+        for key in draw_points:
+            x0, y0 = pts[IDX[key]].astype(int)
+            cv2.circle(frame_bgr, (x0, y0), 2, (0, 255, 0), -1)
+
+        # Contours
+        jaw_chain = ["jaw_left", "jaw_left_mid", "chin", "jaw_right_mid", "jaw_right"]
+        for a, b in zip(jaw_chain, jaw_chain[1:]):
+            ax, ay = pts[IDX[a]].astype(int)
+            bx, by = pts[IDX[b]].astype(int)
+            cv2.line(frame_bgr, (ax, ay), (bx, by), (0, 255, 0), 1)
+
+        lip_chain = [
+            "upper_lip_left", "upper_lip_center", "upper_lip_right",
+            "lower_lip_right", "lower_lip_center", "lower_lip_left",
+            "upper_lip_left",
+        ]
+        for a, b in zip(lip_chain, lip_chain[1:]):
+            ax, ay = pts[IDX[a]].astype(int)
+            bx, by = pts[IDX[b]].astype(int)
+            cv2.line(frame_bgr, (ax, ay), (bx, by), (0, 255, 0), 1)
+
+        oval_chain = [
+            "face_top", "face_left_top", "face_left_bottom",
+            "jaw_left", "chin", "jaw_right",
+            "face_right_bottom", "face_right_top", "face_top",
+        ]
+        for a, b in zip(oval_chain, oval_chain[1:]):
+            ax, ay = pts[IDX[a]].astype(int)
+            bx, by = pts[IDX[b]].astype(int)
+            cv2.line(frame_bgr, (ax, ay), (bx, by), (0, 255, 0), 1)
+
+    def update_frame(self):
+        if not self.running:
+            return
+
+        ok, frame = self.cap.read()
         if not ok:
-            break
+            self.status_var.set("Camera read failed.")
+            self.root.after(30, self.update_frame)
+            return
 
         frame = cv2.flip(frame, 1)
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        res = face_mesh.process(rgb)
+        res = self.face_mesh.process(rgb)
 
-        h, w = frame.shape[:2]
         face_present = bool(res.multi_face_landmarks)
 
-        if baseline is None and auto_calib_armed and face_present and not calibrating:
-            calibrating = True
-            calib_samples = []
-            calib_start = time.time()
-            auto_calib_armed = False
+        # Auto calibration once if baseline missing
+        if self.baseline is None and self.auto_calib_armed and face_present and not self.calibrating:
+            self.calibrating = True
+            self.calib_samples = []
+            self.calib_start = time.time()
+            self.auto_calib_armed = False
+            self.status_var.set("Auto-calibrating… hold neutral for ~2 seconds.")
 
-        status_lines = [
-            f"Data folder: {DATA_DIR}",
-            f"Startup auto-train samples: {trained_n}",
-            "Keys: 1 N 2 H 3 S 4 Angry 5 Sad 6 Disgust 7 Fear | c recal | s save model | q/ESC quit",
-        ]
-
-        if baseline is None and not calibrating:
-            status_lines.append("Auto-calibration: show neutral face…")
-        elif baseline is not None and not calibrating:
-            status_lines.append("Calibrated ✅ (press 'c' to recalibrate)")
-
-        if calibrating:
-            remaining = max(0.0, CALIB_SECONDS - (time.time() - calib_start))
-            status_lines.append(f"Calibrating... hold neutral ({remaining:.1f}s)")
-
-        stable_guess = "Waiting for face…"
-        conf_text = ""
+        pred_label = None
+        conf = None
 
         if face_present:
+            h, w = frame.shape[:2]
             lm = res.multi_face_landmarks[0].landmark
             pts = np.array([[p.x * w, p.y * h] for p in lm], dtype=np.float32)
 
             feats = extract_features(pts)
 
-            if calibrating:
-                calib_samples.append(feats)
-                if (time.time() - calib_start) >= CALIB_SECONDS:
-                    baseline = mean_dict(calib_samples, FEAT_KEYS)
-                    save_baseline(baseline)
-                    calibrating = False
-                    calib_samples = []
-                    emotion_hist.clear()
+            # Calibration sampling
+            if self.calibrating:
+                self.calib_samples.append(feats)
+                if (time.time() - self.calib_start) >= self.CALIB_SECONDS:
+                    self.baseline = mean_dict(self.calib_samples, FEAT_KEYS)
+                    save_baseline(self.baseline)
+                    self.calibrating = False
+                    self.calib_samples = []
+                    self.emotion_hist.clear()
+                    self.status_var.set("Calibrated ✅ (baseline saved)")
 
+            # Smooth features
             for k in FEAT_KEYS:
-                smooth[k] = ema(smooth[k], feats[k], alpha=0.25)
+                self.smooth[k] = ema(self.smooth[k], feats[k], alpha=0.25)
+            s_feats = {**feats, **{k: self.smooth[k] for k in FEAT_KEYS if self.smooth[k] is not None}}
 
-            s_feats = {**feats, **{k: smooth[k] for k in FEAT_KEYS if smooth[k] is not None}}
-
-            if baseline is not None:
-                d = baseline_deltas(s_feats, baseline)
-                last_d = d
+            if self.baseline is not None:
+                d = baseline_deltas(s_feats, self.baseline)
+                self.last_d = d
                 x = d.reshape(1, -1)
-                last_x = x
+                self.last_x = x
 
-                pred, conf = model_predict(model, x)
-                if pred is not None:
-                    guess = pretty_label(pred)
-                    if conf is not None:
-                        conf_text = f"ML confidence: {conf:.2f}"
+                pred_label, conf = model_predict(self.model, x)
+                if pred_label is not None:
+                    pretty = LABEL_TO_PRETTY.get(pred_label, pred_label)
+                    self.emotion_hist.append(pretty)
+                    stable = max(set(self.emotion_hist), key=self.emotion_hist.count)
+                    self.pred_var.set(f"Prediction: {stable}")
                 else:
-                    guess = "Untrained ML (label with keys) 😐"
+                    self.pred_var.set("Prediction: (untrained) label with buttons/keys")
 
-                emotion_hist.append(guess)
-                stable_guess = max(set(emotion_hist), key=emotion_hist.count)
+                if conf is not None:
+                    self.conf_var.set(f"Confidence: {conf:.2f}")
+                else:
+                    self.conf_var.set("Confidence: —")
 
+                # Log predictions periodically
                 t = time.time()
-                if pred is not None and (t - last_log_time) >= LOG_INTERVAL_SEC:
+                if pred_label is not None and (t - self.last_log_time) >= self.LOG_INTERVAL_SEC:
                     append_csv_row(PRED_LOG_PATH, [
-                        now_iso(), pred, f"{conf:.3f}" if conf is not None else "",
+                        now_iso(), pred_label, f"{conf:.3f}" if conf is not None else "",
                         f"{d[0]:+.6f}", f"{d[1]:+.6f}", f"{d[2]:+.6f}", f"{d[3]:+.6f}"
                     ])
-                    last_log_time = t
+                    self.last_log_time = t
             else:
-                stable_guess = "Waiting for calibration…"
+                self.pred_var.set("Prediction: waiting for calibration…")
+                self.conf_var.set("Confidence: —")
 
-            # Draw facial landmarks (expanded)
-            draw_points = [
-                # Eyes + eyelids
-                "left_eye_top", "left_eye_bottom", "left_upper_lid", "left_lower_lid",
-                "right_eye_top", "right_eye_bottom", "right_upper_lid", "right_lower_lid",
+            # Overlay landmarks
+            self.draw_overlay(frame, pts)
 
-                # Brows
-                "left_brow", "right_brow",
+        else:
+            self.pred_var.set("Prediction: (no face detected)")
+            self.conf_var.set("Confidence: —")
+            if self.baseline is None and not self.calibrating:
+                self.status_var.set("Show your face to the camera to calibrate.")
 
-                # Nose + nostrils
-                "nose_bridge", "nose_tip", "nose_left", "nose_right",
-                "nostril_left", "nostril_right",
+        # Draw a small HUD text
+        cv2.putText(frame, APP_NAME, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(frame, "Esc to quit | C calibrate | S save model | 1-7 label", (10, 55),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
 
-                # Mouth / lips
-                "mouth_left", "mouth_right", "mouth_top", "mouth_bottom",
-                "upper_lip_left", "upper_lip_center", "upper_lip_right",
-                "lower_lip_left", "lower_lip_center", "lower_lip_right",
+        # Convert frame to Tk image
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(frame_rgb)
+        imgtk = ImageTk.PhotoImage(image=img)
 
-                # Cheeks / smile lines
-                "left_cheek", "right_cheek",
-                "left_smile_line", "right_smile_line",
+        self.video_label.imgtk = imgtk
+        self.video_label.configure(image=imgtk)
 
-                # Jaw / chin
-                "jaw_left", "jaw_left_mid", "chin", "jaw_right_mid", "jaw_right",
+        self.root.after(15, self.update_frame)
 
-                # Face oval anchors
-                "face_top", "face_left_top", "face_left_bottom",
-                "face_right_top", "face_right_bottom",
-            ]
+    def on_close(self):
+        self.running = False
+        try:
+            if self.cap:
+                self.cap.release()
+        except Exception:
+            pass
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
+        self.root.destroy()
 
-            for key in draw_points:
-                x0, y0 = pts[IDX[key]].astype(int)
-                cv2.circle(frame, (x0, y0), 2, (0, 255, 0), -1)
 
-            # Optional: draw contours (jaw, lips, face oval)
-            jaw_chain = ["jaw_left", "jaw_left_mid", "chin", "jaw_right_mid", "jaw_right"]
-            for a, b in zip(jaw_chain, jaw_chain[1:]):
-                ax, ay = pts[IDX[a]].astype(int)
-                bx, by = pts[IDX[b]].astype(int)
-                cv2.line(frame, (ax, ay), (bx, by), (0, 255, 0), 1)
-
-            lip_chain = [
-                "upper_lip_left", "upper_lip_center", "upper_lip_right",
-                "lower_lip_right", "lower_lip_center", "lower_lip_left",
-                "upper_lip_left",
-            ]
-            for a, b in zip(lip_chain, lip_chain[1:]):
-                ax, ay = pts[IDX[a]].astype(int)
-                bx, by = pts[IDX[b]].astype(int)
-                cv2.line(frame, (ax, ay), (bx, by), (0, 255, 0), 1)
-
-            oval_chain = [
-                "face_top", "face_left_top", "face_left_bottom",
-                "jaw_left", "chin", "jaw_right",
-                "face_right_bottom", "face_right_top", "face_top",
-            ]
-            for a, b in zip(oval_chain, oval_chain[1:]):
-                ax, ay = pts[IDX[a]].astype(int)
-                bx, by = pts[IDX[b]].astype(int)
-                cv2.line(frame, (ax, ay), (bx, by), (0, 255, 0), 1)
-
-            # Overlay
-            y0 = 30
-            cv2.putText(frame, APP_NAME, (10, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
-            y0 += 30
-            cv2.putText(frame, f"Emotion guess: {stable_guess}", (10, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
-            y0 += 26
-            if conf_text:
-                cv2.putText(frame, conf_text, (10, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2)
-
-        sy = frame.shape[0] - 110
-        for line in status_lines:
-            cv2.putText(frame, line, (10, sy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-            sy += 20
-
-        nowt = time.time()
-        dt = nowt - last_time
-        last_time = nowt
-        fps = 0.9 * fps + 0.1 * (1.0 / max(dt, 1e-6))
-        cv2.putText(frame, f"FPS: {fps:.1f}", (10, frame.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
-
-        cv2.imshow(APP_NAME, frame)
-
-        key = cv2.waitKey(1) & 0xFF
-
-        if key in (27, ord('q')):
-            break
-
-        if key == ord('c'):
-            calibrating = True
-            calib_samples = []
-            calib_start = time.time()
-            baseline = None
-            emotion_hist.clear()
-            last_x = None
-            last_d = None
-
-        if key == ord('s'):
-            if model is not None:
-                save_model(model, model_initialized)
-
-        if key in KEY_TO_LABEL and last_x is not None and baseline is not None and last_d is not None:
-            lbl = KEY_TO_LABEL[key]
-
-            append_csv_row(LABELED_PATH, [
-                now_iso(), lbl,
-                f"{last_d[0]:+.6f}", f"{last_d[1]:+.6f}", f"{last_d[2]:+.6f}", f"{last_d[3]:+.6f}"
-            ])
-
-            model, model_initialized = model_online_update(model, last_x, lbl, model_initialized)
-
-    cap.release()
-    cv2.destroyAllWindows()
+def main():
+    root = tk.Tk()
+    # A slightly nicer default size
+    root.geometry("1100x700")
+    # Use ttk theme if available
+    try:
+        style = ttk.Style()
+        style.theme_use("clam")
+    except Exception:
+        pass
+    app = FERApp(root)
+    root.mainloop()
 
 
 if __name__ == "__main__":
