@@ -101,6 +101,7 @@ def save_baseline(baseline: dict):
 # FaceMesh landmark indices (MediaPipe)
 # -----------------------------
 IDX = {
+    # Eyes (key points)
     "left_eye_top": 159,
     "left_eye_bottom": 145,
     "left_eye_left": 33,
@@ -111,16 +112,57 @@ IDX = {
     "right_eye_left": 362,
     "right_eye_right": 263,
 
+    # Eyelids (upper/lower contours)
+    "left_upper_lid": 158,
+    "left_lower_lid": 153,
+    "right_upper_lid": 385,
+    "right_lower_lid": 380,
+
+    # Mouth / lips
     "mouth_left": 61,
     "mouth_right": 291,
     "mouth_top": 13,
     "mouth_bottom": 14,
 
+    # Full lips outline
+    "upper_lip_left": 78,
+    "upper_lip_center": 13,
+    "upper_lip_right": 308,
+    "lower_lip_left": 95,
+    "lower_lip_center": 14,
+    "lower_lip_right": 324,
+
+    # Brows
     "left_brow": 105,
     "right_brow": 334,
 
+    # Nose / nostrils
     "nose_tip": 1,
+    "nose_bridge": 6,
+    "nose_left": 97,
+    "nose_right": 326,
+    "nostril_left": 94,
+    "nostril_right": 331,
+
+    # Cheeks / smile lines
+    "left_cheek": 50,
+    "right_cheek": 280,
+    "left_smile_line": 62,
+    "right_smile_line": 292,
+
+    # Jawline / chin contour
+    "jaw_left": 234,
+    "jaw_left_mid": 172,
     "chin": 152,
+    "jaw_right_mid": 397,
+    "jaw_right": 454,
+
+    # Face oval (full contour anchors)
+    "face_top": 10,
+    "face_left_top": 338,
+    "face_left_bottom": 234,
+    "face_right_top": 109,
+    "face_right_bottom": 454,
 }
 
 FEAT_KEYS = ["eye_open", "mouth_open", "smile", "brow_raise"]
@@ -278,27 +320,21 @@ def retrain_on_startup():
     """
     X, y = load_labeled_dataset()
     if X is None or y is None:
-        # Nothing to train on
         model, initialized = load_model()
         return model, initialized, 0
 
-    # Train fresh model (batch-like using partial_fit in chunks)
     model = make_model()
     clf = model.steps[-1][1]
 
-    # We need at least one partial_fit call with classes.
-    # Fit scaler once on whole X
     scaler = model.steps[0][1]
     scaler.fit(X)
     Xs = scaler.transform(X)
 
-    # Initialize and then train
     clf.partial_fit(Xs[:1], y[:1], classes=CLASSES)
     if len(Xs) > 1:
         clf.partial_fit(Xs[1:], y[1:])
 
     initialized = True
-    # Save the trained model so next start is instant
     save_model(model, initialized)
     return model, initialized, int(len(X))
 
@@ -307,14 +343,10 @@ def retrain_on_startup():
 # Main
 # -----------------------------
 def main():
-    # Create CSVs in the data folder
     ensure_csv_header(PRED_LOG_PATH, ["timestamp", "pred_label", "confidence", "d_eye", "d_mouth", "d_smile", "d_brow"])
     ensure_csv_header(LABELED_PATH, ["timestamp", "true_label", "d_eye", "d_mouth", "d_smile", "d_brow"])
 
-    # Auto-retrain model from labeled dataset
     model, model_initialized, trained_n = retrain_on_startup()
-
-    # Load baseline if you have one
     baseline = load_baseline()
 
     mp_face = mp.solutions.face_mesh
@@ -330,22 +362,18 @@ def main():
     if not cap.isOpened():
         raise RuntimeError("Could not open webcam. Try a different camera index (0, 1, 2...).")
 
-    # Smoothing + stability
     smooth = {k: None for k in FEAT_KEYS}
     emotion_hist = deque(maxlen=12)
 
-    # Calibration (auto if baseline missing)
     calibrating = False
     calib_samples = []
     calib_start = 0.0
     CALIB_SECONDS = 2.0
     auto_calib_armed = (baseline is None)
 
-    # Logging throttle
     LOG_INTERVAL_SEC = 0.5
     last_log_time = 0.0
 
-    # Last vector for labeling
     last_x = None
     last_d = None
 
@@ -364,7 +392,6 @@ def main():
         h, w = frame.shape[:2]
         face_present = bool(res.multi_face_landmarks)
 
-        # Auto-start calibration when face appears (if baseline missing)
         if baseline is None and auto_calib_armed and face_present and not calibrating:
             calibrating = True
             calib_samples = []
@@ -395,7 +422,6 @@ def main():
 
             feats = extract_features(pts)
 
-            # Calibration sampling
             if calibrating:
                 calib_samples.append(feats)
                 if (time.time() - calib_start) >= CALIB_SECONDS:
@@ -405,7 +431,6 @@ def main():
                     calib_samples = []
                     emotion_hist.clear()
 
-            # Smooth features
             for k in FEAT_KEYS:
                 smooth[k] = ema(smooth[k], feats[k], alpha=0.25)
 
@@ -428,7 +453,6 @@ def main():
                 emotion_hist.append(guess)
                 stable_guess = max(set(emotion_hist), key=emotion_hist.count)
 
-                # Log predictions periodically (if model gives a label)
                 t = time.time()
                 if pred is not None and (t - last_log_time) >= LOG_INTERVAL_SEC:
                     append_csv_row(PRED_LOG_PATH, [
@@ -439,12 +463,66 @@ def main():
             else:
                 stable_guess = "Waiting for calibration…"
 
-            # Draw a few landmarks
-            for key in ["mouth_left", "mouth_right", "mouth_top", "mouth_bottom",
-                        "left_eye_top", "left_eye_bottom", "right_eye_top", "right_eye_bottom",
-                        "left_brow", "right_brow"]:
+            # Draw facial landmarks (expanded)
+            draw_points = [
+                # Eyes + eyelids
+                "left_eye_top", "left_eye_bottom", "left_upper_lid", "left_lower_lid",
+                "right_eye_top", "right_eye_bottom", "right_upper_lid", "right_lower_lid",
+
+                # Brows
+                "left_brow", "right_brow",
+
+                # Nose + nostrils
+                "nose_bridge", "nose_tip", "nose_left", "nose_right",
+                "nostril_left", "nostril_right",
+
+                # Mouth / lips
+                "mouth_left", "mouth_right", "mouth_top", "mouth_bottom",
+                "upper_lip_left", "upper_lip_center", "upper_lip_right",
+                "lower_lip_left", "lower_lip_center", "lower_lip_right",
+
+                # Cheeks / smile lines
+                "left_cheek", "right_cheek",
+                "left_smile_line", "right_smile_line",
+
+                # Jaw / chin
+                "jaw_left", "jaw_left_mid", "chin", "jaw_right_mid", "jaw_right",
+
+                # Face oval anchors
+                "face_top", "face_left_top", "face_left_bottom",
+                "face_right_top", "face_right_bottom",
+            ]
+
+            for key in draw_points:
                 x0, y0 = pts[IDX[key]].astype(int)
                 cv2.circle(frame, (x0, y0), 2, (0, 255, 0), -1)
+
+            # Optional: draw contours (jaw, lips, face oval)
+            jaw_chain = ["jaw_left", "jaw_left_mid", "chin", "jaw_right_mid", "jaw_right"]
+            for a, b in zip(jaw_chain, jaw_chain[1:]):
+                ax, ay = pts[IDX[a]].astype(int)
+                bx, by = pts[IDX[b]].astype(int)
+                cv2.line(frame, (ax, ay), (bx, by), (0, 255, 0), 1)
+
+            lip_chain = [
+                "upper_lip_left", "upper_lip_center", "upper_lip_right",
+                "lower_lip_right", "lower_lip_center", "lower_lip_left",
+                "upper_lip_left",
+            ]
+            for a, b in zip(lip_chain, lip_chain[1:]):
+                ax, ay = pts[IDX[a]].astype(int)
+                bx, by = pts[IDX[b]].astype(int)
+                cv2.line(frame, (ax, ay), (bx, by), (0, 255, 0), 1)
+
+            oval_chain = [
+                "face_top", "face_left_top", "face_left_bottom",
+                "jaw_left", "chin", "jaw_right",
+                "face_right_bottom", "face_right_top", "face_top",
+            ]
+            for a, b in zip(oval_chain, oval_chain[1:]):
+                ax, ay = pts[IDX[a]].astype(int)
+                bx, by = pts[IDX[b]].astype(int)
+                cv2.line(frame, (ax, ay), (bx, by), (0, 255, 0), 1)
 
             # Overlay
             y0 = 30
@@ -455,13 +533,11 @@ def main():
             if conf_text:
                 cv2.putText(frame, conf_text, (10, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2)
 
-        # Status
         sy = frame.shape[0] - 110
         for line in status_lines:
             cv2.putText(frame, line, (10, sy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
             sy += 20
 
-        # FPS
         nowt = time.time()
         dt = nowt - last_time
         last_time = nowt
@@ -472,11 +548,9 @@ def main():
 
         key = cv2.waitKey(1) & 0xFF
 
-        # Quit
         if key in (27, ord('q')):
             break
 
-        # Recalibrate baseline
         if key == ord('c'):
             calibrating = True
             calib_samples = []
@@ -486,22 +560,18 @@ def main():
             last_x = None
             last_d = None
 
-        # Save model manually (optional, but handy)
         if key == ord('s'):
             if model is not None:
                 save_model(model, model_initialized)
 
-        # Labeling: write to dataset + online update immediately
         if key in KEY_TO_LABEL and last_x is not None and baseline is not None and last_d is not None:
             lbl = KEY_TO_LABEL[key]
 
-            # Save labeled row (persists across sessions)
             append_csv_row(LABELED_PATH, [
                 now_iso(), lbl,
                 f"{last_d[0]:+.6f}", f"{last_d[1]:+.6f}", f"{last_d[2]:+.6f}", f"{last_d[3]:+.6f}"
             ])
 
-            # Online update so it improves immediately this session
             model, model_initialized = model_online_update(model, last_x, lbl, model_initialized)
 
     cap.release()
