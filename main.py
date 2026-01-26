@@ -61,7 +61,7 @@ index 0000000000000000000000000000000000000000..483beffbf47a720d704371e1e86af5b9
 +            "AU5": ActionUnit("AU5", "Upper lid raise", ("surprise", "fear")),
 +            "AU12": ActionUnit("AU12", "Lip corner puller", ("happiness")),
 +            "AU15": ActionUnit("AU15", "Lip corner depressor", ("sadness")),
-+            "AU20": ActionUnit("AU20", "Lip stretch", ("fear")),
++            "AU20": ActionUnit("AU20", "Lip stretch", ("fear", "happiness")),
 +            "AU23": ActionUnit("AU23", "Lip tightener", ("anger", "disgust")),
 +            "AU26": ActionUnit("AU26", "Jaw drop", ("surprise", "fear")),
 +        }
