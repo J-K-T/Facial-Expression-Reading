@@ -1,0 +1,5 @@
+# Use Python 3.12. MediaPipe 0.10.31+ no longer exposes the
+# legacy `mp.solutions` API used by this script.
+opencv-python>=4.8.0
+mediapipe==0.10.21
+numpy>=1.24.0
